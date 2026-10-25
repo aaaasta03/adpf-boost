@@ -10,13 +10,15 @@ import android.os.SystemClock
 import android.view.Choreographer
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.RadioButton
 import java.util.Locale
 
 /**
- * Measures this app's own Choreographer callbacks, not another game's renderer.
- * Samples frame pacing once per second and compares early vs late windows.
+ * Measures this app's own Choreographer callback intervals, not another game's renderer.
+ * Target FPS is an analysis budget; it does not cap or boost the app's frame rate.
  */
 class MainActivity : Activity(), Choreographer.FrameCallback {
     private val handler = Handler(Looper.getMainLooper())
@@ -24,14 +26,15 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
     private lateinit var output: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var targetGroup: RadioGroup
     private var running = false
     private var startedAt = 0L
     private var sampleWindowStart = 0L
     private var lastFrameNanos = 0L
     private var frameCount = 0
-    private var missedCount = 0
     private val windowFrameTimesMs = ArrayList<Float>()
-    private val targetFrameMs = 1000f / 60f
+    private var targetFps = 60
+    private val targetFrameMs get() = 1000f / targetFps
 
     private val sampleTick = object : Runnable {
         override fun run() {
@@ -39,20 +42,15 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
             val now = SystemClock.elapsedRealtime()
             val windowMs = (now - sampleWindowStart).coerceAtLeast(1L).toFloat()
             val fps = frameCount * 1000f / windowMs
-            val missedPct = if (frameCount == 0) 0f else missedCount * 100f / frameCount
-            val sorted = windowFrameTimesMs.sorted()
-            val p95 = if (sorted.isEmpty()) 0f else sorted[((sorted.size - 1) * 0.95f).toInt()]
             val thermal = readThermal()
             tracker.record(SustainedRunTracker.Sample(
                 elapsedSeconds = (now - startedAt) / 1000L,
                 fps = fps,
-                missedFramePct = missedPct,
-                p95FrameMs = p95,
+                frameIntervalsMs = windowFrameTimesMs.toList(),
                 thermalHeadroom = thermal.first,
                 thermalStatus = thermal.second
             ))
             frameCount = 0
-            missedCount = 0
             windowFrameTimesMs.clear()
             sampleWindowStart = now
             render("RUNNING", now)
@@ -68,10 +66,34 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
             setBackgroundColor(0xFF101820.toInt())
         }
         root.addView(TextView(this).apply {
-            text = "ADPF Performance Lab\nSustained diagnostics"
+            text = "ADPF Performance Lab\nSustained diagnostics v1.1"
             textSize = 24f
             setTextColor(0xFFFFFFFF.toInt())
         })
+        root.addView(TextView(this).apply {
+            text = "Frame-budget target (analysis only):"
+            textSize = 15f
+            setTextColor(0xFFE4EDF5.toInt())
+            setPadding(0, 16, 0, 4)
+        })
+        targetGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            listOf(60, 90, 120).forEach { fps ->
+                addView(RadioButton(this@MainActivity).apply {
+                    id = fps
+                    text = "$fps FPS"
+                    isChecked = fps == targetFps
+                    setTextColor(0xFFE4EDF5.toInt())
+                    setOnClickListener {
+                        if (!running) {
+                            targetFps = fps
+                            render("READY", SystemClock.elapsedRealtime())
+                        }
+                    }
+                })
+            }
+        }
+        root.addView(targetGroup)
         output = TextView(this).apply {
             textSize = 15f
             setTextColor(0xFFE4EDF5.toInt())
@@ -95,16 +117,21 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
 
     private fun startRun() {
         if (running) return
+        targetFps = when (targetGroup.checkedRadioButtonId) {
+            90 -> 90
+            120 -> 120
+            else -> 60
+        }
         running = true
         startedAt = SystemClock.elapsedRealtime()
         sampleWindowStart = startedAt
         lastFrameNanos = 0L
         frameCount = 0
-        missedCount = 0
         windowFrameTimesMs.clear()
         tracker.start(startedAt)
         startButton.isEnabled = false
         stopButton.isEnabled = true
+        for (i in 0 until targetGroup.childCount) targetGroup.getChildAt(i).isEnabled = false
         Choreographer.getInstance().postFrameCallback(this)
         handler.postDelayed(sampleTick, 1000L)
     }
@@ -115,9 +142,8 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
             val deltaMs = (frameTimeNanos - lastFrameNanos) / 1_000_000f
             if (deltaMs.isFinite() && deltaMs > 0f) {
                 frameCount++
-                if (deltaMs > targetFrameMs * 1.5f) missedCount++
                 windowFrameTimesMs.add(deltaMs)
-                // Bound memory if rendering stalls for an extended period.
+                // Bound memory if callbacks stall for an extended period.
                 if (windowFrameTimesMs.size > 3000) windowFrameTimesMs.removeAt(0)
             }
         }
@@ -134,16 +160,17 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
         tracker.stop(now)
         startButton.isEnabled = true
         stopButton.isEnabled = false
+        for (i in 0 until targetGroup.childCount) targetGroup.getChildAt(i).isEnabled = true
         render("STOPPED", now)
     }
 
     private fun render(state: String, now: Long) {
-        val summary = tracker.summary(now)
+        val summary = tracker.summary(now, targetFps)
         val thermal = readThermal()
         val elapsed = if (running) (now - startedAt) / 1000L else summary?.elapsedSeconds ?: 0L
         val b = StringBuilder()
         b.append("State: ").append(state).append("\nElapsed: ").append(elapsed).append(" s\n")
-        b.append(String.format(Locale.US, "Target budget: %.2f ms (60 FPS)\n", targetFrameMs))
+        b.append(String.format(Locale.US, "Target budget: %.2f ms (%d FPS)\n", targetFrameMs, targetFps))
         b.append("Samples: ").append(summary?.sampleCount ?: 0).append("\n")
         b.append("Thermal status: ").append(thermal.second?.let(::thermalName) ?: "unavailable").append("\n")
         b.append("Thermal headroom: ").append(thermal.first?.let { String.format(Locale.US, "%.2f", it) } ?: "unavailable").append("\n\n")
@@ -151,13 +178,16 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
             b.append("Baseline FPS (first 10 s): ").append(fmt(summary.baselineFps)).append("\n")
             b.append("Recent FPS (last 10 s): ").append(fmt(summary.recentFps)).append("\n")
             b.append("FPS drop: ").append(summary.fpsDropPct?.let { String.format(Locale.US, "%.1f%%", it) } ?: "n/a").append("\n")
-            b.append("Baseline missed frames: ").append(fmtPct(summary.baselineMissedPct)).append("\n")
-            b.append("Recent missed frames: ").append(fmtPct(summary.recentMissedPct)).append("\n")
-            b.append("Recent p95 frame time: ").append(summary.recentP95Ms?.let { String.format(Locale.US, "%.2f ms", it) } ?: "n/a").append("\n")
+            b.append("Baseline over-budget intervals: ").append(fmtPct(summary.baselineMissedPct)).append("\n")
+            b.append("Recent over-budget intervals: ").append(fmtPct(summary.recentMissedPct)).append("\n")
+            b.append("Baseline p95 frame interval: ").append(fmtMs(summary.baselineP95Ms)).append("\n")
+            b.append("Recent p95 frame interval: ").append(fmtMs(summary.recentP95Ms)).append("\n")
             b.append("Peak thermal status: ").append(summary.peakThermalStatus?.let(::thermalName) ?: "unavailable").append("\n\n")
             b.append("Assessment: ").append(summary.assessment).append("\n")
+            if (!summary.comparisonReady) b.append("Comparison becomes ready after 20 s with enough samples in both windows.\n")
         }
-        b.append("\nCAVEAT: this measures this app's UI frame pacing only, not a game's FPS. Background load, display refresh rate, and OS scheduling affect results.")
+        b.append("\nNOTE: target FPS is only a comparison threshold; it does not cap frame rate.")
+        b.append("\nCAVEAT: this measures this app's UI callback pacing, not a game's FPS. Display refresh, OS scheduling and background load affect results.")
         output.text = b.toString()
     }
 
@@ -183,6 +213,7 @@ class MainActivity : Activity(), Choreographer.FrameCallback {
 
     private fun fmt(v: Float?): String = v?.let { String.format(Locale.US, "%.1f", it) } ?: "n/a"
     private fun fmtPct(v: Float?): String = v?.let { String.format(Locale.US, "%.1f%%", it) } ?: "n/a"
+    private fun fmtMs(v: Float?): String = v?.let { String.format(Locale.US, "%.2f ms", it) } ?: "n/a"
 
     override fun onDestroy() {
         running = false
